@@ -77,6 +77,10 @@ import { searchLocalRag, searchLocalRagResults, loadRagMediaAttachments, buildRa
 import { resolveApiProviderPdfInputMode, resolveLocalLlmPdfInputMode } from "src/core/pdfInputMode";
 import { createRagSearchRunner, RAG_SEARCH_SYSTEM_PROMPT, RAG_SEARCH_TOOL, RAG_SEARCH_TOOL_NAME, type RagSearchRunner } from "src/core/ragSearchTool";
 import { buildNoDiscoverySystemPrompt } from "./chat/noDiscoveryPrompt";
+import {
+  DEFAULT_DESIRED_VAULT_TOOL_MODE,
+  resolveVaultToolModePolicy,
+} from "./chat/vaultToolModePolicy";
 import { createToolExecutor } from "src/vault/toolExecutor";
 import { extractPdfText } from "obsidian-llm-hub-common/vault";
 import {
@@ -253,28 +257,59 @@ const Chat = forwardRef<ChatRef, ChatProps>(({ plugin, onToggleSidebarWidth }, r
 	);
 	const [webSearchEnabled, setWebSearchEnabled] = useState(plugin.workspaceState.webSearchEnabled === true);
 
-	// Vault tool mode includes readOnly for search/read without mutations.
-	// Gemma 4 + RAG/Web Search: must disable function calling tools (mutually exclusive)
+	// Vault tool safety has two layers:
+	// - desired mode: the user's per-chat safety preference
+	// - effective mode: what the current model/provider can actually expose
+	//
+	// Every independent chat starts from Read Only. Temporary model capability
+	// restrictions must never silently turn that preference into All.
 	const initialModel = plugin.getSelectedModel();
-	// Mirror isCliMode's exception for tools-capable Local LLMs: they should
-	// boot with vaultToolMode "all", not "none" — same default as API providers.
+
 	const initialLocalLlmConfig = isLocalLlmModel(initialModel)
 		? getLocalLlmConfig(initialModel, plugin.settings)
 		: null;
-	const initialLocalLlmToolsCapable = !!(initialLocalLlmConfig
-		&& isLocalLlmToolsEnabled(initialLocalLlmConfig, initialLocalLlmConfig.model));
-	const isInitialVaultRestrictedCli = initialModel === "antigravity-cli"
+
+	const initialLocalLlmToolsCapable = !!(
+		initialLocalLlmConfig
+		&& isLocalLlmToolsEnabled(
+			initialLocalLlmConfig,
+			initialLocalLlmConfig.model,
+		)
+	);
+
+	const isInitialVaultRestrictedCli =
+		initialModel === "antigravity-cli"
 		|| initialModel === "claude-cli"
-		|| (isLocalLlmModel(initialModel) && !initialLocalLlmToolsCapable);
-	const initialGemma4Rag = initialModel.toLowerCase().includes("gemma-4")
-		&& (plugin.workspaceState.selectedRagSetting != null || plugin.workspaceState.webSearchEnabled === true);
+		|| (
+			isLocalLlmModel(initialModel)
+			&& !initialLocalLlmToolsCapable
+		);
+
+	const initialGemma4Rag =
+		initialModel.toLowerCase().includes("gemma-4")
+		&& (
+			plugin.workspaceState.selectedRagSetting != null
+			|| plugin.workspaceState.webSearchEnabled === true
+		);
+
+	const desiredVaultToolModeRef = useRef<VaultToolMode>(
+		DEFAULT_DESIRED_VAULT_TOOL_MODE,
+	);
+
+	const initialVaultToolPolicy = resolveVaultToolModePolicy({
+		desiredMode: desiredVaultToolModeRef.current,
+		restrictedByModel: isInitialVaultRestrictedCli,
+		gemmaSearchConflict: initialGemma4Rag,
+	});
+
 	const [vaultToolMode, setVaultToolMode] = useState<VaultToolMode>(
-		(isInitialVaultRestrictedCli || initialGemma4Rag) ? "none" : "all"
+		initialVaultToolPolicy.effectiveMode,
 	);
-	// Reason why vault tools are "none" - determines whether MCP should also be disabled
-	const [vaultToolNoneReason, setVaultToolNoneReason] = useState<VaultToolNoneReason | null>(
-		isInitialVaultRestrictedCli ? "cli" : initialGemma4Rag ? "manual" : null
-	);
+
+	const [vaultToolNoneReason, setVaultToolNoneReason] =
+		useState<VaultToolNoneReason | null>(
+			initialVaultToolPolicy.noneReason,
+		);
 	// MCP servers state: local copy with per-server enabled state (for chat session)
 	const [mcpServers, setMcpServers] = useState(() =>
 		(isInitialVaultRestrictedCli || initialGemma4Rag)
@@ -1008,11 +1043,21 @@ const Chat = forwardRef<ChatRef, ChatProps>(({ plugin, onToggleSidebarWidth }, r
 
 	// Handle vault tool mode change from UI
 	const handleVaultToolModeChange = (mode: VaultToolMode) => {
+		desiredVaultToolModeRef.current = mode;
+
 		setVaultToolMode(mode);
 		setVaultToolNoneReason(mode === "none" ? "manual" : null);
+
 		// Gemma 4: vault tools enabled → clear RAG/Web Search
-		if (isGemma4(currentModel) && mode !== "none" && (selectedRagSetting || webSearchEnabled)) {
-			handleSearchSelectionChange({ ragSetting: null, webSearch: false });
+		if (
+			isGemma4(currentModel)
+			&& mode !== "none"
+			&& (selectedRagSetting || webSearchEnabled)
+		) {
+			handleSearchSelectionChange({
+				ragSetting: null,
+				webSearch: false,
+			});
 		}
 	};
 
@@ -1063,34 +1108,55 @@ const Chat = forwardRef<ChatRef, ChatProps>(({ plugin, onToggleSidebarWidth }, r
 		const isNewModelVaultRestrictedCli = model === "antigravity-cli" || model === "claude-cli"
 			|| (isLocalLlmModel(model) && !isNewLocalLlmToolsCapable);
 		// Auto-adjust search setting and vault tool mode for CLI mode and special models
-		if (isNewModelVaultRestrictedCli) {
-			// CLI mode: disable vault tools and MCP
-			setVaultToolMode("none");
-			setVaultToolNoneReason("cli");
-			setMcpServers(servers => servers.map(s => ({ ...s, enabled: false })));
-		} else if (model === "codex-cli") {
-			// Codex receives the plugin's confirmation-gated Vault tools over MCP.
-			setVaultToolMode("all");
-			setVaultToolNoneReason(null);
-			setMcpServers(servers => servers.map(s => ({ ...s, enabled: false })));
-		} else if (isImageGenerationModel(model)) {
-			// RAG was cleared above; image models keep any independent Web Search selection.
-			setVaultToolMode("all");
-			setVaultToolNoneReason(null);
-		} else if (isGemma4(model)) {
-			// Gemma 4: RAG/Web Search and function calling are mutually exclusive
-			if (selectedRagSetting || webSearchEnabled) {
-				// RAG or Web Search active → disable vault tools
-				setVaultToolMode("none");
-				setVaultToolNoneReason("manual");
-				setMcpServers(servers => servers.map(s => ({ ...s, enabled: false })));
-			}
-		} else {
-			// Normal models: restore vault tools
-			setVaultToolMode("all");
-			setVaultToolNoneReason(null);
+		// Resolve the effective Vault mode without destroying the user's desired
+		// safety preference. A restricted provider temporarily exposes Off, then
+		// restores the desired mode when returning to a capable provider.
+		const gemmaSearchConflict =
+			isGemma4(model)
+			&& Boolean(selectedRagSetting || webSearchEnabled);
+
+		const nextVaultPolicy = resolveVaultToolModePolicy({
+			desiredMode: desiredVaultToolModeRef.current,
+			restrictedByModel: isNewModelVaultRestrictedCli,
+			gemmaSearchConflict,
+		});
+
+		setVaultToolMode(nextVaultPolicy.effectiveMode);
+		setVaultToolNoneReason(nextVaultPolicy.noneReason);
+
+		// MCP availability keeps the upstream capability rules.
+		// Codex uses the plugin's dedicated Vault MCP bridge rather than the ordinary
+		// configured MCP-server selection.
+		if (
+			isNewModelVaultRestrictedCli
+			|| model === "codex-cli"
+			|| gemmaSearchConflict
+		) {
+			setMcpServers((servers) =>
+				servers.map((server) => ({
+					...server,
+					enabled: false,
+				})),
+			);
 		}
 	};
+
+	const resetVaultSafetyForChatContext = () => {
+		desiredVaultToolModeRef.current =
+			DEFAULT_DESIRED_VAULT_TOOL_MODE;
+
+		const nextPolicy = resolveVaultToolModePolicy({
+			desiredMode: DEFAULT_DESIRED_VAULT_TOOL_MODE,
+			restrictedByModel: isVaultToolRestrictedCliMode,
+			gemmaSearchConflict:
+				isGemma4(currentModel)
+				&& Boolean(selectedRagSetting || webSearchEnabled),
+		});
+
+		setVaultToolMode(nextPolicy.effectiveMode);
+		setVaultToolNoneReason(nextPolicy.noneReason);
+	};
+
 
 	const handleCodexConfigChange = (model: string | undefined, reasoningEffort: import("src/types").CodexReasoningEffort) => {
 		const nextCliConfig = {
@@ -1229,6 +1295,7 @@ const Chat = forwardRef<ChatRef, ChatProps>(({ plugin, onToggleSidebarWidth }, r
 	// continues in the background and saves its result to history when done).
 	const startNewChat = () => {
 		leaveCurrentChat();
+		resetVaultSafetyForChatContext();
 
 		setMessages([]);
 		setCurrentChatId(null);
@@ -1248,6 +1315,9 @@ const Chat = forwardRef<ChatRef, ChatProps>(({ plugin, onToggleSidebarWidth }, r
 		leaveCurrentChat();
 		try {
 			const parsed = await decryptChat(chatId, password);
+
+			resetVaultSafetyForChatContext();
+
 			setMessages(parsed.messages);
 			setCurrentChatId(chatId);
 			setCliSession(parsed.cliSession || null);
@@ -1283,6 +1353,7 @@ const Chat = forwardRef<ChatRef, ChatProps>(({ plugin, onToggleSidebarWidth }, r
 			setDecryptPassword("");
 			return;
 		}
+		resetVaultSafetyForChatContext();
 		setMessages(history.messages);
 		setCurrentChatId(history.id);
 		setCliSession(history.cliSession || null);  // Restore CLI session
