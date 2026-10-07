@@ -40,7 +40,19 @@ export class LocalLlmModal extends Modal {
 
     const descEl = contentEl.createDiv({ cls: "llm-hub-modal-desc" });
     descEl.textContent = t("settings.localLlmModal.desc");
+    // Display name
+    new Setting(contentEl)
+      .setName(t("settings.apiProviderName"))
+      .addText((text) => {
+        text
+          .setPlaceholder("Ollama tools")
+          .setValue(this.config.name || "")
+          .onChange((value) => {
+            this.config.name = value;
+          });
 
+        text.inputEl.addClass("llm-hub-wide-input");
+      });
     // Framework
     const frameworkDefaults: Record<LlmFramework, string> = {
       ollama: "http://localhost:11434",
@@ -318,6 +330,8 @@ export class LocalLlmModal extends Modal {
           .setButtonText(t("common.save"))
           .setCta()
           .onClick(() => {
+            this.config.name = this.config.name?.trim() || undefined;
+            
             if (!this.config.baseUrl.trim()) {
               new Notice(t("settings.localLlmModal.baseUrlRequired"));
               return;
