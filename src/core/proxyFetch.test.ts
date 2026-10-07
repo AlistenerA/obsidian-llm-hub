@@ -229,19 +229,78 @@ function createProxyServer(opts?: { requireAuth?: { user: string; pass: string }
  * Generate a self-signed certificate for 127.0.0.1.
  */
 function generateSelfSignedCert(): Promise<{ key: string; cert: string }> {
-  const { execSync } = require("child_process") as typeof import("child_process");
+  const { execFileSync } = require("child_process") as typeof import("child_process");
   const os = require("os") as typeof import("os");
   const path = require("path") as typeof import("path");
   const fs = require("fs") as typeof import("fs");
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-test-"));
+
   const keyPath = path.join(tmpDir, "key.pem");
+  const certPath = path.join(tmpDir, "cert.pem");
+  const configPath = path.join(tmpDir, "openssl.cnf");
+
+  const opensslConfig = `
+[req]
+distinguished_name = dn
+prompt = no
+
+[dn]
+CN = 127.0.0.1
+
+[v3_req]
+subjectAltName = IP:127.0.0.1
+`;
+
   try {
-    execSync(`openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out ${keyPath} 2>/dev/null`);
-    const cert = execSync(
-      `openssl req -new -x509 -key ${keyPath} -days 1 -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1" 2>/dev/null`,
-    ).toString();
+    fs.writeFileSync(configPath, opensslConfig, "utf8");
+
+    execFileSync(
+      "openssl",
+      [
+        "genpkey",
+        "-algorithm",
+        "RSA",
+        "-pkeyopt",
+        "rsa_keygen_bits:2048",
+        "-out",
+        keyPath,
+      ],
+      {
+        stdio: ["ignore", "ignore", "pipe"],
+      },
+    );
+
+    execFileSync(
+      "openssl",
+      [
+        "req",
+        "-new",
+        "-x509",
+        "-key",
+        keyPath,
+        "-out",
+        certPath,
+        "-days",
+        "1",
+        "-sha256",
+        "-config",
+        configPath,
+        "-extensions",
+        "v3_req",
+      ],
+      {
+        stdio: ["ignore", "ignore", "pipe"],
+        env: {
+          ...process.env,
+          OPENSSL_CONF: configPath,
+        },
+      },
+    );
+
     const key = fs.readFileSync(keyPath, "utf8");
+    const cert = fs.readFileSync(certPath, "utf8");
+
     return Promise.resolve({ key, cert });
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -311,14 +370,22 @@ function listen(server: http.Server | https.Server): Promise<number> {
   });
 }
 
-function close(server: http.Server | https.Server): Promise<void> {
+function close(server?: http.Server | https.Server): Promise<void> {
+  if (!server) {
+    return Promise.resolve();
+  }
+
   if (typeof (server as any).destroyAll === "function") {
     (server as any).destroyAll();
   }
+
   if (typeof (server as any).closeAllConnections === "function") {
     (server as any).closeAllConnections();
   }
-  return new Promise((resolve) => server.close(() => resolve()));
+
+  return new Promise((resolve) => {
+    server.close(() => resolve());
+  });
 }
 
 // ---------------------------------------------------------------------------
